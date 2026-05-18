@@ -85,7 +85,13 @@ class BaselineDroneSimulator:
         self._k_Q = float(self.spec.propeller.drag_coefficient)
         self._omega_max = float(self.spec.motor.omega_max)
         self._tau_motor = float(self.spec.motor.time_constant)
+        self._drag_linear = np.asarray(self.spec.aero.drag_linear, dtype=np.float64)
+        self._v_nominal = float(self.spec.battery.voltage_nominal)
+        self._r_internal = float(self.spec.battery.internal_resistance)
+        self._k_v = self._omega_max / self._v_nominal  # [rad/s / V]
+        self._omega_max_nominal = float(self.spec.motor.omega_max)
 
+        
         # Mutable state — initialized in reset().
         self._position = np.zeros(3, dtype=np.float64)
         self._velocity = np.zeros(3, dtype=np.float64)
@@ -113,13 +119,9 @@ class BaselineDroneSimulator:
         ext_ground_z: Optional[float] = None,
     ) -> None:
         # ext_ground_z is the world-frame z of the surface below the drone,
-        # used by tier-1 ground-effect models. The baseline does NOT model
-        # ground effect, so this argument is accepted for protocol
-        # compatibility and ignored. To pick up the +5 T1.F bonus, fork
-        # this method and amplify per-motor thrust by
-        #   1 + a * (R / max(z - ext_ground_z, eps))^2
-        # before summing into F_body.
-        del ext_ground_z
+        # used by tier-1 ground-effect models (T1.F).
+        # This implementation models ground effect via thrust amplification
+        # when the drone is within 4 rotor radii of a surface.
 
         motor_cmds = np.clip(np.asarray(motor_cmds, dtype=np.float64), 0.0, 1.0)
         if motor_cmds.shape != (self.spec.num_motors,):
@@ -139,7 +141,7 @@ class BaselineDroneSimulator:
         n_sub = max(1, int(np.ceil(dt / MAX_INTERNAL_DT_S)))
         sub_dt = dt / n_sub
         for _ in range(n_sub):
-            self._integrate_substep(motor_cmds, ext_force_world, ext_torque_world, sub_dt)
+            self._integrate_substep(motor_cmds, ext_force_world, ext_torque_world, sub_dt, ext_ground_z)
 
     def _integrate_substep(
         self,
@@ -147,12 +149,13 @@ class BaselineDroneSimulator:
         ext_force_world: np.ndarray,
         ext_torque_world: np.ndarray,
         sub_dt: float,
+        ext_ground_z: Optional[float] = None,
     ) -> None:
         # 1. Motor RPM dynamics (exact integration of first-order lag)
         self._motor_dynamics_step(motor_cmds, sub_dt)
 
         # 2. Body-frame force and torque from current motor RPMs
-        F_body, tau_body = self._compute_motor_wrench()
+        F_body, tau_body = self._compute_motor_wrench(ext_ground_z)
 
         # 3. Body -> world rotation
         R = self._rotation_matrix(self._quat)
@@ -161,6 +164,8 @@ class BaselineDroneSimulator:
         F_world = R @ F_body
         F_world += np.array([0.0, 0.0, -self._mass * GRAVITY])
         F_world += ext_force_world
+        # T1.C: Linear aerodynamic drag opposes velocity in world frame.
+        F_world -= self._velocity * self._drag_linear
 
         # 5. Total body-frame torque (external world torque rotated into body)
         tau_body_total = tau_body + R.T @ ext_torque_world
@@ -198,6 +203,7 @@ class BaselineDroneSimulator:
         Exact integration of  dω/dt = (ω_cmd - ω) / τ  over dt:
             ω_new = ω + (1 - exp(-dt/τ)) * (ω_cmd - ω)
         """
+        
         omega_cmd = motor_cmds * self._omega_max
         if self._tau_motor <= 0:
             self._motor_omegas = omega_cmd  # instant response
@@ -205,7 +211,7 @@ class BaselineDroneSimulator:
             alpha = 1.0 - np.exp(-dt / self._tau_motor)
             self._motor_omegas = self._motor_omegas + alpha * (omega_cmd - self._motor_omegas)
 
-    def _compute_motor_wrench(self):
+    def _compute_motor_wrench(self, ext_ground_z: Optional[float] = None):
         """Sum thrust forces and reaction torques from current motor RPMs.
 
         Returns (F_body, tau_body), both (3,) arrays.
@@ -214,6 +220,21 @@ class BaselineDroneSimulator:
         T = self._k_T * omega2                            # (N,) thrust magnitudes
         Q = self._k_Q * omega2                            # (N,) drag-torque magnitudes
 
+        # T1.F: Ground effect — Cheeseman-Bennett correction applied when the
+        # environment supplies the surface elevation (ext_ground_z).  The model
+        # amplifies thrust by  1 + a·(R/z)²  where R is the rotor radius and z
+        # is the clearance above the surface.  The factor a = 0.3 matches the
+        # standard Cheeseman-Bennett approximation.  Active only within 4·R
+        # (typical IGE boundary); max(altitude, 1e-6) prevents division by zero
+        # during ground contact.
+        if ext_ground_z is not None:
+            radius = float(self.spec.propeller.diameter) / 2
+            altitude = self._position[2] - ext_ground_z
+            if altitude < 4 * radius:
+                a = 0.3
+                ground_effect = 1.0 + a * (radius / max(altitude, 1e-6)) ** 2
+                T = T * ground_effect
+                
         # Thrust force vectors: each motor pushes along its thrust_axis.
         F_motors = T[:, None] * self._motor_axes          # (N, 3)
         F_body = F_motors.sum(axis=0)                     # (3,)
